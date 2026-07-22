@@ -56,6 +56,15 @@ profit factor, and P&L. Note: no commissions/slippage are modeled, so treat
 marginal results (profit factor ≈ 1.0) as break-even at best. Tune the
 strategy via `.env` (e.g. `VOLUME_SPIKE_MULT`, `TAKE_PROFIT_PCT`) and re-run.
 
+## Discord alerts
+
+Get entries, exits with P&L, circuit-breaker halts, and an end-of-day recap
+pushed to your phone:
+
+1. In Discord: **Server Settings → Integrations → Webhooks → New Webhook → Copy URL**
+2. Set `DISCORD_WEBHOOK_URL=<your url>` in `.env` (or as a Railway/Claw variable)
+3. Done — alerts arrive as color-coded embeds. Leave the var empty to disable.
+
 ## Deploy to Railway (run 24/7, manage from your phone)
 
 The repo includes `railway.toml`, `Procfile`, and `runtime.txt` — zero extra
