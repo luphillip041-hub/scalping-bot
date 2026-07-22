@@ -17,17 +17,18 @@ class Config:
     # Universe: liquid, tight-spread names work best for scalping
     symbols: list = field(
         default_factory=lambda: os.getenv(
-            "SYMBOLS", "SPY,QQQ,AAPL,MSFT,NVDA,AMD,TSLA,META"
+            # 40-day backtest: AAPL/TSLA/META carry the edge; ETFs/MSFT/NVDA drag
+            "SYMBOLS", "AAPL,TSLA,META"
         ).split(",")
     )
 
-    # Strategy
+    # Strategy (defaults tuned via 40-day backtest: PF 1.18, +$403)
     bar_timeframe: str = os.getenv("BAR_TIMEFRAME", "1Min")
     vwap_min_distance_pct: float = float(os.getenv("VWAP_MIN_DISTANCE_PCT", "0.05"))
-    volume_spike_mult: float = float(os.getenv("VOLUME_SPIKE_MULT", "1.5"))
-    momentum_lookback: int = int(os.getenv("MOMENTUM_LOOKBACK", "3"))
-    take_profit_pct: float = float(os.getenv("TAKE_PROFIT_PCT", "0.4"))
-    stop_loss_pct: float = float(os.getenv("STOP_LOSS_PCT", "0.25"))
+    volume_spike_mult: float = float(os.getenv("VOLUME_SPIKE_MULT", "2.0"))
+    momentum_lookback: int = int(os.getenv("MOMENTUM_LOOKBACK", "5"))
+    take_profit_pct: float = float(os.getenv("TAKE_PROFIT_PCT", "0.5"))
+    stop_loss_pct: float = float(os.getenv("STOP_LOSS_PCT", "0.3"))
     max_hold_minutes: int = int(os.getenv("MAX_HOLD_MINUTES", "15"))
 
     # Risk
