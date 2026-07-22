@@ -95,6 +95,12 @@ class ScalpingBot:
         self.entry_prices[symbol] = price
         self.risk.register_trade(datetime.now(ET).date())
         log.info("ENTER %s %s x%d @ ~%.2f (tp %.2f / sl %.2f)", side.value, symbol, qty, price, tp, sl)
+        send(
+            f"{'📈' if side == Side.LONG else '📉'} Entered {side.value.upper()} {symbol}",
+            f"Bracket order submitted",
+            "entry_long" if side == Side.LONG else "entry_short",
+            {"Qty": qty, "Entry ~": f"${price:.2f}", "TP": f"${tp:.2f}", "SL": f"${sl:.2f}"},
+        )
 
     def _check_time_exits(self, positions):
         now = datetime.now(ET)
@@ -131,13 +137,23 @@ class ScalpingBot:
         acct = self.trading.get_account()
         log.info("Connected. Account %s | equity $%s | paper=%s",
                  acct.account_number, acct.equity, self.cfg.paper)
+        was_in_session = False
         while True:
             try:
                 if not self._in_session():
+                    if was_in_session:
+                        # session just ended → daily recap
+                        send("📋 Daily recap",
+                             f"Session over. Realized P&L: ${self.risk.daily_pnl:+.2f}",
+                             "exit_win" if self.risk.daily_pnl > 0 else "exit_loss",
+                             {"Trades": self.risk._trade_count,
+                              "Halted by loss limit": self.risk.halted})
+                        was_in_session = False
                     log.info("Outside session %s–%s ET. Sleeping 60s.",
                              self.cfg.trade_start, self.cfg.trade_end)
                     time.sleep(60)
                     continue
+                was_in_session = True
 
                 positions = self._open_positions()
                 self._sync_closed(positions)
