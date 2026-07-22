@@ -43,11 +43,32 @@ Get paper-trading keys at <https://app.alpaca.markets> → Paper Trading → API
 Everything is tuned via `.env` — see `.env.example`. Symbols default to
 liquid names: `SPY,QQQ,AAPL,MSFT,NVDA,AMD,TSLA,META`.
 
-## Run 24/7
+## Backtest before you trade
 
-Deploy to Railway/Render/Fly as a worker process with `python main.py` as the
-start command and the env vars set in the dashboard. It sleeps outside market
-hours and trades only during the session window.
+```bash
+python backtest.py            # last 20 trading days, default symbols
+DAYS=40 SYMBOLS=SPY,QQQ python backtest.py
+```
+
+It walks forward bar-by-bar with the same signal, bracket, time-exit, and
+circuit-breaker logic as the live bot, then reports per-symbol win rate,
+profit factor, and P&L. Note: no commissions/slippage are modeled, so treat
+marginal results (profit factor ≈ 1.0) as break-even at best. Tune the
+strategy via `.env` (e.g. `VOLUME_SPIKE_MULT`, `TAKE_PROFIT_PCT`) and re-run.
+
+## Deploy to Railway (run 24/7, manage from your phone)
+
+The repo includes `railway.toml`, `Procfile`, and `runtime.txt` — zero extra
+config needed:
+
+1. Go to [railway.app](https://railway.app) → **New Project → Deploy from GitHub repo** → pick `scalping-bot`
+2. In the project → **Variables**, add `ALPACA_API_KEY` and `ALPACA_API_SECRET`
+   (plus any tuning vars from `.env.example`)
+3. Deploy. Railway auto-detects Python, installs `requirements.txt`, and runs
+   `python main.py`. It restarts automatically on failure.
+4. Watch logs and stop/start anytime from the Railway mobile app or browser.
+
+The bot sleeps outside market hours and only trades 09:35–15:50 ET on weekdays.
 
 ## Disclaimer
 
