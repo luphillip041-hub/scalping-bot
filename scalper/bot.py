@@ -160,7 +160,9 @@ class ScalpingBot:
                 self._check_time_exits(positions)
 
                 today = datetime.now(ET).date()
-                ok, why = self.risk.can_trade(len(positions), today)
+                # only count OUR positions — unrelated holds don't consume slots
+                own = [s for s in positions if s in self.cfg.symbols]
+                ok, why = self.risk.can_trade(len(own), today)
                 if not ok:
                     log.warning("No new trades: %s", why)
                     time.sleep(self.cfg.poll_seconds)
