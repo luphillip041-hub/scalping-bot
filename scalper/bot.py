@@ -18,6 +18,7 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
 
 from .config import Config
+from .notify import send
 from .risk import RiskManager
 from .strategy import Side, generate_signal
 
@@ -194,3 +195,4 @@ class ScalpingBot:
             except Exception as e:
                 log.exception("loop error: %s", e)
                 time.sleep(self.cfg.poll_seconds)
+
