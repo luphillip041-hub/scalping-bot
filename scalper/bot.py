@@ -46,6 +46,8 @@ class ScalpingBot:
         self.tracked_positions: dict[str, tuple[float, datetime, str]] = {}
         # Cache for last synced position state
         self._last_synced_positions = set()
+        # Track last sync time to avoid duplicate notifications
+        self._last_position_check = datetime.now(ET)
 
     # ---------- helpers ----------
     def _in_session(self) -> bool:
@@ -103,18 +105,22 @@ class ScalpingBot:
             log.warning("failed to fetch filled orders: %s", e)
             return []
 
-    def _calculate_realized_pnl(self) -> float:
-        """Calculate realized PnL from today's filled orders (sell - buy pairs)."""
-        today = datetime.now(ET).date()
-        today_start = datetime.now(ET).replace(hour=0, minute=0, second=0, microsecond=0)
+    def _calculate_realized_pnl(self, after: datetime = None) -> float:
+        """Calculate realized PnL from filled orders (sell - buy pairs).
         
-        orders = self._get_filled_orders(after=today_start)
+        Args:
+            after: Only count orders filled after this timestamp.
+        
+        Returns:
+            Total realized PnL from buy/sell pairs.
+        """
+        orders = self._get_filled_orders(after=after)
         pnl = 0.0
         
         # Group by symbol and track entry/exit
         symbol_fills = {}
         for o in orders:
-            if not o.filled_at or o.filled_at.date() != today:
+            if not o.filled_at:
                 continue
             sym = o.symbol
             if sym not in symbol_fills:
@@ -200,49 +206,65 @@ class ScalpingBot:
                     try:
                         self.trading.close_position(sym)
                         exit_price = positions[sym].current_price
+                        qty = self.risk.qty_for(entry_price)
+                        pnl = (exit_price - entry_price) * qty
+                        self.risk.record_close(pnl, datetime.now(ET).date())
                         send(
                             "⏱️ Time-based exit",
                             f"Closed {sym} after {self.cfg.max_hold_minutes} minutes",
-                            "exit_win",
-                            {"Exit Price": f"${exit_price:.2f}", "Hold Time": f"{self.cfg.max_hold_minutes}m"},
+                            "exit_win" if pnl > 0 else "exit_loss",
+                            {"Exit Price": f"${exit_price:.2f}", "PnL": f"${pnl:+.2f}", "Hold Time": f"{self.cfg.max_hold_minutes}m"},
                         )
                     except Exception as e:
                         log.error("Failed to close position %s: %s", sym, e)
                 self.tracked_positions.pop(sym, None)
 
-    def _record_closed_position(self, symbol: str, positions: dict):
-        """Record PnL for a closed position and clean up tracking."""
-        if symbol not in self.tracked_positions:
-            return
-        
-        entry_price, entered_at, order_id = self.tracked_positions[symbol]
-        qty = self.risk.qty_for(entry_price)
-        
-        # Try to get actual exit price from recent orders
-        exit_price = entry_price
-        try:
-            orders = self.trading.get_orders(limit=50, status=OrderStatus.FILLED)
-            for o in orders:
-                if o.symbol == symbol and o.id != order_id and o.filled_at:
-                    exit_price = o.filled_avg_price
-                    break
-        except Exception:
-            pass
-        
-        pnl = (exit_price - entry_price) * qty
-        self.risk.record_close(pnl, datetime.now(ET).date())
-        log.info("CLOSE %s pnl=$%.2f (daily $%.2f)", symbol, pnl, self.risk.daily_pnl)
-        self.tracked_positions.pop(symbol, None)
-
     def _sync_positions(self, positions):
-        """Detect and record closed positions; clean up stale tracking."""
+        """Detect and record closed positions; clean up stale tracking.
+        
+        When a position closes via TP/SL (bracket legs), we detect it here
+        and send a notification.
+        """
         current_syms = set(positions.keys())
         
         # Find positions we tracked that are now closed
         for sym in list(self.tracked_positions.keys()):
             if sym not in current_syms and sym not in self._last_synced_positions:
-                # Position just closed
-                self._record_closed_position(sym, positions)
+                # Position just closed — fetch its exit info and notify
+                entry_price, entered_at, order_id = self.tracked_positions[sym]
+                qty = self.risk.qty_for(entry_price)
+                
+                # Try to get actual exit price and reason (TP vs SL)
+                exit_price = entry_price
+                exit_reason = "bracket exit"
+                try:
+                    orders = self.trading.get_orders(limit=50, status=OrderStatus.FILLED)
+                    for o in orders:
+                        if o.symbol == sym and o.id != order_id and o.filled_at:
+                            exit_price = o.filled_avg_price
+                            # Determine if it was TP or SL based on order type
+                            if o.order_class == "bracket":
+                                exit_reason = "take profit" if (
+                                    (o.side == OrderSide.SELL and o.filled_avg_price > entry_price) or
+                                    (o.side == OrderSide.BUY and o.filled_avg_price < entry_price)
+                                ) else "stop loss"
+                            break
+                except Exception:
+                    pass
+                
+                pnl = (exit_price - entry_price) * qty
+                self.risk.record_close(pnl, datetime.now(ET).date())
+                log.info("CLOSE %s via %s pnl=$%.2f (daily $%.2f)", sym, exit_reason, pnl, self.risk.daily_pnl)
+                
+                # Send notification
+                send(
+                    f"{'✅' if pnl > 0 else '❌'} Exit {sym.upper()} ({exit_reason})",
+                    f"Position closed",
+                    "exit_win" if pnl > 0 else "exit_loss",
+                    {"Exit": f"${exit_price:.2f}", "PnL": f"${pnl:+.2f}", "Reason": exit_reason},
+                )
+                
+                self.tracked_positions.pop(sym, None)
             elif sym not in current_syms:
                 # Already detected; clean up
                 self.tracked_positions.pop(sym, None)
@@ -255,22 +277,33 @@ class ScalpingBot:
         log.info("Connected. Account %s | equity $%s | paper=%s",
                  acct.account_number, acct.equity, self.cfg.paper)
         was_in_session = False
+        session_start_time = None
+        
         while True:
             try:
                 if not self._in_session():
                     if was_in_session:
-                        # session just ended → daily recap
+                        # session just ended → daily recap with realized PnL
+                        realized_pnl = self._calculate_realized_pnl(after=session_start_time)
                         send("📋 Daily recap",
-                             f"Session over. Realized P&L: ${self.risk.daily_pnl:+.2f}",
-                             "exit_win" if self.risk.daily_pnl > 0 else "exit_loss",
+                             f"Session over. Realized P&L: ${realized_pnl:+.2f} | Risk tracked: ${self.risk.daily_pnl:+.2f}",
+                             "exit_win" if realized_pnl > 0 else "exit_loss",
                              {"Trades": self.risk._trade_count,
-                              "Halted by loss limit": self.risk.halted})
+                              "Realized PnL": f"${realized_pnl:+.2f}",
+                              "Halted": "Yes" if self.risk.halted else "No"})
                         was_in_session = False
                     log.info("Outside session %s–%s ET. Sleeping 60s.",
                              self.cfg.trade_start, self.cfg.trade_end)
                     time.sleep(60)
                     continue
-                was_in_session = True
+                
+                if not was_in_session:
+                    was_in_session = True
+                    session_start_time = datetime.now(ET)
+                    send("🟢 Trading session started", 
+                         f"Session active {self.cfg.trade_start}–{self.cfg.trade_end} ET",
+                         "info",
+                         {})
 
                 try:
                     positions = self._open_positions()
