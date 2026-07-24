@@ -15,6 +15,7 @@ class RiskManager:
     _halted: bool = False
 
     def _roll_day(self, today: date):
+        """Reset daily counters if date has changed."""
         if self._day != today:
             self._day = today
             self._realized_pnl = 0.0
@@ -22,32 +23,39 @@ class RiskManager:
             self._halted = False
 
     def record_close(self, pnl: float, today: date):
+        """Record a closed position's PnL and check if loss limit is breached."""
         self._roll_day(today)
         self._realized_pnl += pnl
         if self._realized_pnl <= -abs(self.max_daily_loss_usd):
             self._halted = True
 
     def can_trade(self, open_positions: int, today: date) -> tuple[bool, str]:
+        """Check if we can open a new position given risk constraints."""
         self._roll_day(today)
         if self._halted:
             return False, f"halted: daily loss ${self._realized_pnl:.2f}"
         if self._trade_count >= self.max_trades_per_day:
-            return False, "halted: max trades/day reached"
+            return False, f"halted: {self._trade_count}/{self.max_trades_per_day} max trades reached"
         if open_positions >= self.max_positions:
-            return False, "halted: max positions reached"
+            return False, f"halted: {open_positions}/{self.max_positions} max positions reached"
         return True, "ok"
 
     def register_trade(self, today: date):
+        """Increment daily trade counter when an order is submitted."""
         self._roll_day(today)
         self._trade_count += 1
 
     def qty_for(self, price: float) -> int:
+        """Calculate position size in shares for a given price."""
         return max(1, int(self.position_size_usd // price))
 
     @property
     def daily_pnl(self) -> float:
+        """Current day's realized PnL."""
         return self._realized_pnl
 
     @property
     def halted(self) -> bool:
+        """Whether trading is halted due to daily loss limit."""
         return self._halted
+
