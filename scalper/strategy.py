@@ -23,29 +23,48 @@ class Signal:
 
 
 def compute_vwap(bars) -> float:
-    """Session VWAP from a list of bars (each needs .high .low .close .volume)."""
+    """Session VWAP from a list of bars (each needs .high .low .close .volume).
+    
+    Returns 0 if no valid bars or zero volume.
+    """
+    if not bars:
+        return 0.0
+    
     pv = sum(((b.high + b.low + b.close) / 3) * b.volume for b in bars)
     vol = sum(b.volume for b in bars)
-    return pv / vol if vol else 0.0
+    return pv / vol if vol > 0 else 0.0
 
 
 def avg_volume(bars, n: int) -> float:
+    """Average volume of the last n bars (or fewer if fewer bars exist)."""
+    if not bars:
+        return 0.0
     tail = bars[-n:] if len(bars) >= n else bars
     vols = [b.volume for b in tail]
     return sum(vols) / len(vols) if vols else 0.0
 
 
 def generate_signal(bars, cfg) -> Signal | None:
-    """Return a Signal or None. `bars` = today's 1-min bars, oldest first."""
-    if len(bars) < cfg.momentum_lookback + 5:
+    """Return a Signal or None. `bars` = today's 1-min bars, oldest first.
+    
+    Validates sufficient bar count before computing indicators.
+    """
+    # Require minimum bars for momentum lookback + buffer
+    min_bars = cfg.momentum_lookback + 5
+    if len(bars) < min_bars:
         return None
 
     vwap = compute_vwap(bars)
-    if vwap == 0:
+    if vwap <= 0:
         return None
 
     last = bars[-1]
     prev = bars[-2]
+    
+    # Validate bar integrity
+    if not hasattr(last, 'close') or not hasattr(last, 'volume'):
+        return None
+    
     dist_pct = (last.close - vwap) / vwap * 100
 
     # momentum: close higher/lower than N bars ago
@@ -66,11 +85,16 @@ def generate_signal(bars, cfg) -> Signal | None:
         and mom > 0
         and last.close > vwap
     ):
-        return Signal(Side.LONG, f"VWAP cross up + vol x{last.volume / baseline:.1f}")
+        vol_ratio = last.volume / baseline if baseline > 0 else 0
+        return Signal(Side.LONG, f"VWAP cross up + vol x{vol_ratio:.1f}")
+    
     if (
         (crossed_down or dist_pct < -cfg.vwap_min_distance_pct)
         and mom < 0
         and last.close < vwap
     ):
-        return Signal(Side.SHORT, f"VWAP cross down + vol x{last.volume / baseline:.1f}")
+        vol_ratio = last.volume / baseline if baseline > 0 else 0
+        return Signal(Side.SHORT, f"VWAP cross down + vol x{vol_ratio:.1f}")
+    
     return None
+
