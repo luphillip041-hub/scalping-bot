@@ -15,10 +15,17 @@ class Config:
     paper: bool = os.getenv("ALPACA_PAPER", "true").lower() == "true"
 
     # Universe: liquid, tight-spread names work best for scalping
+    # Curated list: high volume, low spreads, consistent intraday volatility
+    # Mega-cap tech: AAPL, MSFT, NVDA, TSLA
+    # Mega-cap finance: JPM, BAC, WFC, GS
+    # Growth/momentum: AMZN, GOOGL, META, NFLX
+    # Defensive: PG, KO, JNJ, PEP
+    # Semiconductors: AMD, QCOM, AVGO, MU
+    # Energy: XOM, CVX
     symbols: list = field(
         default_factory=lambda: os.getenv(
-            # 40-day backtest: AAPL/TSLA/META carry the edge; ETFs/MSFT/NVDA drag
-            "SYMBOLS", "AAPL,TSLA,META"
+            "SYMBOLS",
+            "AAPL,MSFT,NVDA,TSLA,AMZN,GOOGL,META,NFLX,JPM,BAC,AMD,QCOM",
         ).split(",")
     )
 
@@ -33,9 +40,9 @@ class Config:
 
     # Risk
     position_size_usd: float = float(os.getenv("POSITION_SIZE_USD", "2000"))
-    max_positions: int = int(os.getenv("MAX_POSITIONS", "3"))
-    max_daily_loss_usd: float = float(os.getenv("MAX_DAILY_LOSS_USD", "150"))
-    max_trades_per_day: int = int(os.getenv("MAX_TRADES_PER_DAY", "25"))
+    max_positions: int = int(os.getenv("MAX_POSITIONS", "5"))
+    max_daily_loss_usd: float = float(os.getenv("MAX_DAILY_LOSS_USD", "300"))
+    max_trades_per_day: int = int(os.getenv("MAX_TRADES_PER_DAY", "50"))
 
     # Session (ET): avoid first/last 5 min of the open/close
     trade_start: str = os.getenv("TRADE_START", "09:35")
@@ -46,3 +53,4 @@ class Config:
     def validate(self):
         if not self.api_key or not self.api_secret:
             raise ValueError("Set ALPACA_API_KEY and ALPACA_API_SECRET in .env")
+
