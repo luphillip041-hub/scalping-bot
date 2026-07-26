@@ -14,7 +14,7 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.data.enums import DataFeed
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus
 from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
 
 from .config import Config
@@ -24,6 +24,10 @@ from .strategy import Side, generate_signal
 
 log = logging.getLogger("scalper")
 ET = ZoneInfo("America/New_York")
+
+# Retry config for transient failures
+MAX_RETRIES = 3
+RETRY_DELAY = 1  # seconds
 
 
 class ScalpingBot:
@@ -38,8 +42,12 @@ class ScalpingBot:
             max_positions=cfg.max_positions,
             position_size_usd=cfg.position_size_usd,
         )
-        self.entry_times: dict[str, datetime] = {}
-        self.entry_prices: dict[str, float] = {}
+        # Track positions by symbol -> (entry_price, entry_time, order_id)
+        self.tracked_positions: dict[str, tuple[float, datetime, str]] = {}
+        # Cache for last synced position state
+        self._last_synced_positions = set()
+        # Track last sync time to avoid duplicate notifications
+        self._last_position_check = datetime.now(ET)
 
     # ---------- helpers ----------
     def _in_session(self) -> bool:
@@ -50,6 +58,7 @@ class ScalpingBot:
         return self.cfg.trade_start <= t <= self.cfg.trade_end
 
     def _todays_bars(self, symbol: str):
+        """Fetch today's bars with retry logic."""
         now = datetime.now(ET)
         start = now.replace(hour=9, minute=30, second=0, microsecond=0)
         tf_map = {"1Min": TimeFrame.Minute, "5Min": TimeFrame(5, TimeFrameUnit.Minute)}
@@ -60,29 +69,103 @@ class ScalpingBot:
             end=now,
             feed=DataFeed.IEX,  # free plan: SIP blocks the last 15 min
         )
-        bars = self.data.get_stock_bars(req).data.get(symbol, [])
-        return list(bars)
+        for attempt in range(MAX_RETRIES):
+            try:
+                bars = self.data.get_stock_bars(req).data.get(symbol, [])
+                return list(bars)
+            except Exception as e:
+                if attempt == MAX_RETRIES - 1:
+                    raise
+                log.warning("bars %s (attempt %d/%d): %s, retrying...", symbol, attempt + 1, MAX_RETRIES, e)
+                time.sleep(RETRY_DELAY)
+        return []
 
     def _open_positions(self):
-        return {p.symbol: p for p in self.trading.get_all_positions()}
+        """Fetch all open positions from Alpaca."""
+        for attempt in range(MAX_RETRIES):
+            try:
+                return {p.symbol: p for p in self.trading.get_all_positions()}
+            except Exception as e:
+                if attempt == MAX_RETRIES - 1:
+                    raise
+                log.warning("open_positions (attempt %d/%d): %s, retrying...", attempt + 1, MAX_RETRIES, e)
+                time.sleep(RETRY_DELAY)
+        return {}
 
-    def _realized_today(self):
-        """Approximate realized PnL from today's closed orders."""
-        today = datetime.now(ET).date()
+    def _get_filled_orders(self, after: datetime = None) -> list:
+        """Fetch filled orders from Alpaca for PnL tracking."""
+        try:
+            # Get orders from today or since a specific time
+            limit = 100
+            orders = self.trading.get_orders(limit=limit, status=OrderStatus.FILLED)
+            if after:
+                orders = [o for o in orders if o.filled_at and o.filled_at > after]
+            return orders
+        except Exception as e:
+            log.warning("failed to fetch filled orders: %s", e)
+            return []
+
+    def _calculate_realized_pnl(self, after: datetime = None) -> float:
+        """Calculate realized PnL from filled orders (sell - buy pairs).
+        
+        Args:
+            after: Only count orders filled after this timestamp.
+        
+        Returns:
+            Total realized PnL from buy/sell pairs.
+        """
+        orders = self._get_filled_orders(after=after)
         pnl = 0.0
-        for sym, entry_px in list(self.entry_prices.items()):
-            if sym not in self._open_positions() and sym in self.entry_times:
-                # position closed since last check — estimate via last fill
-                pass
+        
+        # Group by symbol and track entry/exit
+        symbol_fills = {}
+        for o in orders:
+            if not o.filled_at:
+                continue
+            sym = o.symbol
+            if sym not in symbol_fills:
+                symbol_fills[sym] = []
+            symbol_fills[sym].append(o)
+        
+        # Calculate PnL for each symbol's trades
+        for sym, fills in symbol_fills.items():
+            # Sort by fill time
+            fills.sort(key=lambda x: x.filled_at)
+            buy_qty = 0
+            buy_cost = 0.0
+            for fill in fills:
+                if fill.side == OrderSide.BUY:
+                    buy_qty += fill.qty
+                    buy_cost += fill.qty * fill.filled_avg_price
+                elif fill.side == OrderSide.SELL:
+                    if buy_qty > 0:
+                        pnl += fill.qty * (fill.filled_avg_price - buy_cost / buy_qty)
+                        buy_qty -= fill.qty
+                        if buy_qty <= 0:
+                            buy_qty = 0
+                            buy_cost = 0.0
+        
         return pnl
 
     # ---------- order handling ----------
     def _submit_bracket(self, symbol: str, side: Side):
+        """Submit bracket order with proper TP/SL for long/short."""
         bars = self._todays_bars(symbol)
+        if not bars:
+            log.error("No bars available for %s", symbol)
+            return
+        
         price = bars[-1].close
         qty = self.risk.qty_for(price)
-        tp = price * (1 + self.cfg.take_profit_pct / 100) if side == Side.LONG else price * (1 - self.cfg.take_profit_pct / 100)
-        sl = price * (1 - self.cfg.stop_loss_pct / 100) if side == Side.LONG else price * (1 + self.cfg.stop_loss_pct / 100)
+        
+        # Calculate TP and SL based on direction
+        if side == Side.LONG:
+            tp = price * (1 + self.cfg.take_profit_pct / 100)
+            sl = price * (1 - self.cfg.stop_loss_pct / 100)
+        else:  # SHORT
+            tp = price * (1 - self.cfg.take_profit_pct / 100)
+            sl = price * (1 + self.cfg.stop_loss_pct / 100)
+        
         order = MarketOrderRequest(
             symbol=symbol,
             qty=qty,
@@ -91,47 +174,102 @@ class ScalpingBot:
             take_profit=TakeProfitRequest(limit_price=round(tp, 2)),
             stop_loss=StopLossRequest(stop_price=round(sl, 2)),
         )
-        self.trading.submit_order(order)
-        self.entry_times[symbol] = datetime.now(ET)
-        self.entry_prices[symbol] = price
-        self.risk.register_trade(datetime.now(ET).date())
-        log.info("ENTER %s %s x%d @ ~%.2f (tp %.2f / sl %.2f)", side.value, symbol, qty, price, tp, sl)
-        send(
-            f"{'📈' if side == Side.LONG else '📉'} Entered {side.value.upper()} {symbol}",
-            f"Bracket order submitted",
-            "entry_long" if side == Side.LONG else "entry_short",
-            {"Qty": qty, "Entry ~": f"${price:.2f}", "TP": f"${tp:.2f}", "SL": f"${sl:.2f}"},
-        )
+        
+        try:
+            placed_order = self.trading.submit_order(order)
+            self.tracked_positions[symbol] = (price, datetime.now(ET), placed_order.id)
+            self.risk.register_trade(datetime.now(ET).date())
+            log.info("ENTER %s %s x%d @ %.2f (tp %.2f / sl %.2f)", side.value, symbol, qty, price, tp, sl)
+            send(
+                f"{'📈' if side == Side.LONG else '📉'} Entered {side.value.upper()} {symbol}",
+                f"Bracket order submitted",
+                "entry_long" if side == Side.LONG else "entry_short",
+                {"Qty": qty, "Entry": f"${price:.2f}", "TP": f"${tp:.2f}", "SL": f"${sl:.2f}"},
+            )
+        except Exception as e:
+            log.error("Failed to submit bracket for %s: %s", symbol, e)
+            send(
+                "⚠️ Order submission failed",
+                f"Could not enter {symbol}: {str(e)}",
+                "info",
+                {"Symbol": symbol},
+            )
 
     def _check_time_exits(self, positions):
+        """Close positions that have exceeded max hold time."""
         now = datetime.now(ET)
-        for sym, pos in positions.items():
-            entered = self.entry_times.get(sym)
-            if entered and (now - entered) > timedelta(minutes=self.cfg.max_hold_minutes):
-                log.info("TIME EXIT %s after %d min", sym, self.cfg.max_hold_minutes)
-                self.trading.close_position(sym)
-                self._record_result(sym, float(pos.current_price))
+        for sym in list(self.tracked_positions.keys()):
+            entry_price, entered_at, order_id = self.tracked_positions[sym]
+            if (now - entered_at) > timedelta(minutes=self.cfg.max_hold_minutes):
+                if sym in positions:
+                    log.info("TIME EXIT %s after %d min", sym, self.cfg.max_hold_minutes)
+                    try:
+                        self.trading.close_position(sym)
+                        exit_price = positions[sym].current_price
+                        qty = self.risk.qty_for(entry_price)
+                        pnl = (exit_price - entry_price) * qty
+                        self.risk.record_close(pnl, datetime.now(ET).date())
+                        send(
+                            "⏱️ Time-based exit",
+                            f"Closed {sym} after {self.cfg.max_hold_minutes} minutes",
+                            "exit_win" if pnl > 0 else "exit_loss",
+                            {"Exit Price": f"${exit_price:.2f}", "PnL": f"${pnl:+.2f}", "Hold Time": f"{self.cfg.max_hold_minutes}m"},
+                        )
+                    except Exception as e:
+                        log.error("Failed to close position %s: %s", sym, e)
+                self.tracked_positions.pop(sym, None)
 
-    def _record_result(self, symbol: str, exit_price: float):
-        entry = self.entry_prices.pop(symbol, None)
-        self.entry_times.pop(symbol, None)
-        if entry:
-            # qty no longer available here; approximate with configured size
-            qty = self.risk.qty_for(entry)
-            pnl = (exit_price - entry) * qty
-            self.risk.record_close(pnl, datetime.now(ET).date())
-            log.info("CLOSE %s pnl≈$%.2f (daily $%.2f)", symbol, pnl, self.risk.daily_pnl)
-
-    def _sync_closed(self, positions):
-        """Detect positions closed by bracket legs and record PnL."""
-        for sym in list(self.entry_prices):
-            if sym not in positions:
+    def _sync_positions(self, positions):
+        """Detect and record closed positions; clean up stale tracking.
+        
+        When a position closes via TP/SL (bracket legs), we detect it here
+        and send a notification.
+        """
+        current_syms = set(positions.keys())
+        
+        # Find positions we tracked that are now closed
+        for sym in list(self.tracked_positions.keys()):
+            if sym not in current_syms and sym not in self._last_synced_positions:
+                # Position just closed — fetch its exit info and notify
+                entry_price, entered_at, order_id = self.tracked_positions[sym]
+                qty = self.risk.qty_for(entry_price)
+                
+                # Try to get actual exit price and reason (TP vs SL)
+                exit_price = entry_price
+                exit_reason = "bracket exit"
                 try:
-                    quote_bars = self._todays_bars(sym)
-                    px = quote_bars[-1].close if quote_bars else self.entry_prices[sym]
+                    orders = self.trading.get_orders(limit=50, status=OrderStatus.FILLED)
+                    for o in orders:
+                        if o.symbol == sym and o.id != order_id and o.filled_at:
+                            exit_price = o.filled_avg_price
+                            # Determine if it was TP or SL based on order type
+                            if o.order_class == "bracket":
+                                exit_reason = "take profit" if (
+                                    (o.side == OrderSide.SELL and o.filled_avg_price > entry_price) or
+                                    (o.side == OrderSide.BUY and o.filled_avg_price < entry_price)
+                                ) else "stop loss"
+                            break
                 except Exception:
-                    px = self.entry_prices[sym]
-                self._record_result(sym, px)
+                    pass
+                
+                pnl = (exit_price - entry_price) * qty
+                self.risk.record_close(pnl, datetime.now(ET).date())
+                log.info("CLOSE %s via %s pnl=$%.2f (daily $%.2f)", sym, exit_reason, pnl, self.risk.daily_pnl)
+                
+                # Send notification
+                send(
+                    f"{'✅' if pnl > 0 else '❌'} Exit {sym.upper()} ({exit_reason})",
+                    f"Position closed",
+                    "exit_win" if pnl > 0 else "exit_loss",
+                    {"Exit": f"${exit_price:.2f}", "PnL": f"${pnl:+.2f}", "Reason": exit_reason},
+                )
+                
+                self.tracked_positions.pop(sym, None)
+            elif sym not in current_syms:
+                # Already detected; clean up
+                self.tracked_positions.pop(sym, None)
+        
+        self._last_synced_positions = current_syms
 
     # ---------- main loop ----------
     def run(self):
@@ -139,60 +277,83 @@ class ScalpingBot:
         log.info("Connected. Account %s | equity $%s | paper=%s",
                  acct.account_number, acct.equity, self.cfg.paper)
         was_in_session = False
+        session_start_time = None
+        
         while True:
             try:
                 if not self._in_session():
                     if was_in_session:
-                        # session just ended → daily recap
+                        # session just ended → daily recap with realized PnL
+                        realized_pnl = self._calculate_realized_pnl(after=session_start_time)
                         send("📋 Daily recap",
-                             f"Session over. Realized P&L: ${self.risk.daily_pnl:+.2f}",
-                             "exit_win" if self.risk.daily_pnl > 0 else "exit_loss",
+                             f"Session over. Realized P&L: ${realized_pnl:+.2f} | Risk tracked: ${self.risk.daily_pnl:+.2f}",
+                             "exit_win" if realized_pnl > 0 else "exit_loss",
                              {"Trades": self.risk._trade_count,
-                              "Halted by loss limit": self.risk.halted})
+                              "Realized PnL": f"${realized_pnl:+.2f}",
+                              "Halted": "Yes" if self.risk.halted else "No"})
                         was_in_session = False
                     log.info("Outside session %s–%s ET. Sleeping 60s.",
                              self.cfg.trade_start, self.cfg.trade_end)
                     time.sleep(60)
                     continue
-                was_in_session = True
+                
+                if not was_in_session:
+                    was_in_session = True
+                    session_start_time = datetime.now(ET)
+                    send("🟢 Trading session started", 
+                         f"Session active {self.cfg.trade_start}–{self.cfg.trade_end} ET",
+                         "info",
+                         {})
 
-                positions = self._open_positions()
-                self._sync_closed(positions)
+                try:
+                    positions = self._open_positions()
+                except Exception as e:
+                    log.error("Failed to fetch positions: %s", e)
+                    time.sleep(self.cfg.poll_seconds)
+                    continue
+
+                self._sync_positions(positions)
                 self._check_time_exits(positions)
 
                 today = datetime.now(ET).date()
-                # only count OUR positions — unrelated holds don't consume slots
-                own = [s for s in positions if s in self.cfg.symbols]
-                ok, why = self.risk.can_trade(len(own), today)
+                # only count tracked positions
+                ok, why = self.risk.can_trade(len(self.tracked_positions), today)
                 if not ok:
                     log.warning("No new trades: %s", why)
                     time.sleep(self.cfg.poll_seconds)
                     continue
 
                 for sym in self.cfg.symbols:
-                    if sym in positions or sym in self.entry_prices:
+                    if sym in positions or sym in self.tracked_positions:
                         continue
+                    
                     try:
                         bars = self._todays_bars(sym)
                     except Exception as e:
-                        log.error("bars %s: %s", sym, e)
+                        log.error("Failed to fetch bars for %s: %s", sym, e)
                         continue
+                    
+                    # Validate we have enough bars for strategy
+                    if len(bars) < 10:
+                        continue
+                    
                     sig = generate_signal(bars, self.cfg)
                     if sig:
                         log.info("SIGNAL %s %s — %s", sym, sig.side.value, sig.reason)
                         try:
                             self._submit_bracket(sym, sig.side)
-                            ok, why = self.risk.can_trade(len(self._open_positions()), today)
+                            # Re-check if we can trade after this order
+                            ok, why = self.risk.can_trade(len(self.tracked_positions), today)
                             if not ok:
                                 break
                         except Exception as e:
-                            log.error("order %s: %s", sym, e)
+                            log.error("Failed to submit order for %s: %s", sym, e)
 
                 time.sleep(self.cfg.poll_seconds)
             except KeyboardInterrupt:
                 log.info("Stopped by user.")
                 break
             except Exception as e:
-                log.exception("loop error: %s", e)
+                log.exception("Loop error: %s", e)
                 time.sleep(self.cfg.poll_seconds)
 
