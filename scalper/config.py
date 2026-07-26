@@ -15,10 +15,21 @@ class Config:
     paper: bool = os.getenv("ALPACA_PAPER", "true").lower() == "true"
 
     # Universe: liquid, tight-spread names work best for scalping
+    # Default: 20 mega-cap tech + growth + finance stocks (all >$1T / >$100B market cap)
+    # Expanded from 3 → 20 tickers for better diversification and opportunity surface
     symbols: list = field(
         default_factory=lambda: os.getenv(
-            # 40-day backtest: AAPL/TSLA/META carry the edge; ETFs/MSFT/NVDA drag
-            "SYMBOLS", "AAPL,TSLA,META"
+            "SYMBOLS",
+            # Tech & Cloud: highest volume, tightest spreads
+            "AAPL,MSFT,NVDA,TSLA,META,"
+            # Growth & Payment: consistent volume
+            "AMZN,GOOGL,NFLX,GOOG,"
+            # Financial Services: diverse market conditions
+            "JPM,BAC,GS,BLK,V,MA,"
+            # Semiconductors: volatile, good scalping moves
+            "AMD,QCOM,MU,AVGO,"
+            # Industrials/Discretionary: broader market correlation
+            "BA,F"
         ).split(",")
     )
 
@@ -33,9 +44,9 @@ class Config:
 
     # Risk
     position_size_usd: float = float(os.getenv("POSITION_SIZE_USD", "2000"))
-    max_positions: int = int(os.getenv("MAX_POSITIONS", "3"))
-    max_daily_loss_usd: float = float(os.getenv("MAX_DAILY_LOSS_USD", "150"))
-    max_trades_per_day: int = int(os.getenv("MAX_TRADES_PER_DAY", "25"))
+    max_positions: int = int(os.getenv("MAX_POSITIONS", "5"))  # expanded from 3
+    max_daily_loss_usd: float = float(os.getenv("MAX_DAILY_LOSS_USD", "300"))  # expanded from 150
+    max_trades_per_day: int = int(os.getenv("MAX_TRADES_PER_DAY", "50"))  # expanded from 25
 
     # Session (ET): avoid first/last 5 min of the open/close
     trade_start: str = os.getenv("TRADE_START", "09:35")
@@ -46,3 +57,4 @@ class Config:
     def validate(self):
         if not self.api_key or not self.api_secret:
             raise ValueError("Set ALPACA_API_KEY and ALPACA_API_SECRET in .env")
+
