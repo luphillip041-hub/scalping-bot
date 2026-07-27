@@ -1,6 +1,6 @@
 """Options order management for calls/puts scalping.
 
-Fetches option chains via Alpaca API, selects contracts based on Greeks and 
+Fetches option contracts via Alpaca API, selects based on Greeks and 
 strike offset, and submits market orders for options trades alongside equities.
 """
 import logging
@@ -11,6 +11,8 @@ from enum import Enum
 from typing import Optional
 
 from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import GetOptionContractsRequest
+from alpaca.trading.enums import ContractType
 
 log = logging.getLogger("scalper")
 ET = ZoneInfo("America/New_York")
@@ -68,7 +70,7 @@ class OptionContract:
 
 
 class OptionsFetcher:
-    """Fetch and parse options chains from Alpaca."""
+    """Fetch and parse options contracts from Alpaca."""
 
     def __init__(self, trading_client: TradingClient):
         self.trading = trading_client
@@ -86,57 +88,35 @@ class OptionsFetcher:
         contracts = []
         
         try:
-            # Fetch from Alpaca: get_option_chain() returns options for a symbol
-            # Alpaca SDK v0.44+ supports this via REST API
-            chain_data = self.trading.get_option_chain(symbol)
-            if not chain_data:
-                log.warning("Empty options chain for %s expiry %s", symbol, expiry_date)
-                return []
+            # Convert YYYYMMDD to YYYY-MM-DD for API
+            exp_formatted = f"{expiry_date[:4]}-{expiry_date[4:6]}-{expiry_date[6:8]}"
             
-            # Parse chain data into OptionContract objects
-            # Alpaca returns: {strike: {call: {...}, put: {...}}, ...}
-            for strike, legs in chain_data.items():
-                # Process calls
-                if "call" in legs and legs["call"]:
-                    call_data = legs["call"]
-                    if self._has_market_data(call_data):
-                        contracts.append(OptionContract(
-                            symbol=symbol,
-                            contract_symbol=call_data.get("symbol", ""),
-                            side=OptionSide.CALL,
-                            expiry=expiry_date,
-                            strike=float(strike),
-                            bid=float(call_data.get("bid", 0)),
-                            ask=float(call_data.get("ask", 0)),
-                            delta=float(call_data.get("delta", 0)),
-                            theta=float(call_data.get("theta", 0)),
-                            gamma=float(call_data.get("gamma", 0)),
-                            vega=float(call_data.get("vega", 0)),
-                            iv=float(call_data.get("implied_volatility", 0)),
-                            open_interest=int(call_data.get("open_interest", 0)),
-                            volume=int(call_data.get("volume", 0)),
-                        ))
-                
-                # Process puts
-                if "put" in legs and legs["put"]:
-                    put_data = legs["put"]
-                    if self._has_market_data(put_data):
-                        contracts.append(OptionContract(
-                            symbol=symbol,
-                            contract_symbol=put_data.get("symbol", ""),
-                            side=OptionSide.PUT,
-                            expiry=expiry_date,
-                            strike=float(strike),
-                            bid=float(put_data.get("bid", 0)),
-                            ask=float(put_data.get("ask", 0)),
-                            delta=float(put_data.get("delta", 0)),
-                            theta=float(put_data.get("theta", 0)),
-                            gamma=float(put_data.get("gamma", 0)),
-                            vega=float(put_data.get("vega", 0)),
-                            iv=float(put_data.get("implied_volatility", 0)),
-                            open_interest=int(put_data.get("open_interest", 0)),
-                            volume=int(put_data.get("volume", 0)),
-                        ))
+            # Fetch calls
+            call_request = GetOptionContractsRequest(
+                underlying_symbol=symbol,
+                expiration_date=exp_formatted,
+                contract_type=ContractType.CALL
+            )
+            call_response = self.trading.get_option_contracts(call_request)
+            if call_response and call_response.option_contracts:
+                for contract in call_response.option_contracts:
+                    if self._has_market_data(contract):
+                        contracts.append(self._parse_contract(contract, OptionSide.CALL, expiry_date))
+            
+            # Fetch puts
+            put_request = GetOptionContractsRequest(
+                underlying_symbol=symbol,
+                expiration_date=exp_formatted,
+                contract_type=ContractType.PUT
+            )
+            put_response = self.trading.get_option_contracts(put_request)
+            if put_response and put_response.option_contracts:
+                for contract in put_response.option_contracts:
+                    if self._has_market_data(contract):
+                        contracts.append(self._parse_contract(contract, OptionSide.PUT, expiry_date))
+            
+            if not contracts:
+                log.warning("Empty options chain for %s expiry %s", symbol, expiry_date)
         
         except Exception as e:
             log.error("Failed to fetch options chain for %s: %s", symbol, e)
@@ -144,10 +124,32 @@ class OptionsFetcher:
         return contracts
 
     @staticmethod
-    def _has_market_data(contract_data: dict) -> bool:
+    def _parse_contract(contract_data, side: OptionSide, expiry_date: str) -> OptionContract:
+        """Parse Alpaca contract data into OptionContract object."""
+        return OptionContract(
+            symbol=contract_data.underlying_symbol,
+            contract_symbol=contract_data.symbol,
+            side=side,
+            expiry=expiry_date,
+            strike=float(contract_data.strike_price),
+            bid=float(contract_data.quote.bid if contract_data.quote and contract_data.quote.bid else 0),
+            ask=float(contract_data.quote.ask if contract_data.quote and contract_data.quote.ask else 0),
+            delta=float(contract_data.greeks.delta if contract_data.greeks and contract_data.greeks.delta else 0),
+            theta=float(contract_data.greeks.theta if contract_data.greeks and contract_data.greeks.theta else 0),
+            gamma=float(contract_data.greeks.gamma if contract_data.greeks and contract_data.greeks.gamma else 0),
+            vega=float(contract_data.greeks.vega if contract_data.greeks and contract_data.greeks.vega else 0),
+            iv=float(contract_data.greeks.implied_volatility if contract_data.greeks and contract_data.greeks.implied_volatility else 0),
+            open_interest=int(contract_data.open_interest if contract_data.open_interest else 0),
+            volume=int(contract_data.quote.volume if contract_data.quote and contract_data.quote.volume else 0),
+        )
+
+    @staticmethod
+    def _has_market_data(contract_data) -> bool:
         """Check if contract has valid bid/ask prices."""
-        bid = float(contract_data.get("bid", 0))
-        ask = float(contract_data.get("ask", 0))
+        if not contract_data.quote:
+            return False
+        bid = float(contract_data.quote.bid if contract_data.quote.bid else 0)
+        ask = float(contract_data.quote.ask if contract_data.quote.ask else 0)
         return bid > 0 and ask > 0
 
 
