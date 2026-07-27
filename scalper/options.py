@@ -307,14 +307,12 @@ class OptionSelector:
         Returns expiry date in YYYYMMDD format based on days_to_expiry.
         """
         now = datetime.now(ET)
-        days_ahead = self.days_to_expiry
+        # Start from today + days_to_expiry, then skip forward to next weekday
+        target = now + timedelta(days=self.days_to_expiry)
         
-        while days_ahead >= 0:
-            target = now + timedelta(days=days_ahead)
-            # Skip weekends (5=Sat, 6=Sun)
-            if target.weekday() < 5:
-                return target.strftime("%Y%m%d")
-            days_ahead += 1
+        # Skip forward if we land on a weekend (5=Sat, 6=Sun)
+        while target.weekday() >= 5:
+            target += timedelta(days=1)
         
-        return now.strftime("%Y%m%d")
+        return target.strftime("%Y%m%d")
 
