@@ -9,7 +9,7 @@ import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.historical import StockHistoricalDataClient, OptionHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.data.enums import DataFeed
@@ -37,6 +37,7 @@ class ScalpingBot:
         self.cfg = cfg
         self.trading = TradingClient(cfg.api_key, cfg.api_secret, paper=cfg.paper)
         self.data = StockHistoricalDataClient(cfg.api_key, cfg.api_secret)
+        self.option_data = OptionHistoricalDataClient(cfg.api_key, cfg.api_secret) if cfg.enable_options else None
         self.risk = RiskManager(
             max_daily_loss_usd=cfg.max_daily_loss_usd,
             max_trades_per_day=cfg.max_trades_per_day,
@@ -51,7 +52,7 @@ class ScalpingBot:
         # Track last sync time to avoid duplicate notifications
         self._last_position_check = datetime.now(ET)
         # Options support
-        self.option_fetcher = OptionsFetcher(self.trading) if cfg.enable_options else None
+        self.option_fetcher = OptionsFetcher(self.trading, self.option_data) if cfg.enable_options else None
         self.option_selector = OptionSelector(
             days_to_expiry=cfg.options_expiry_days,
             strike_offset_pct=cfg.options_strike_offset_pct,
