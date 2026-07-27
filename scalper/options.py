@@ -89,6 +89,8 @@ class OptionsFetcher:
             List of OptionContract objects (calls + puts) with Greeks and market data
         """
         contracts = []
+        calls_parsed = 0
+        puts_parsed = 0
         
         try:
             # Convert YYYYMMDD to YYYY-MM-DD for API
@@ -101,16 +103,15 @@ class OptionsFetcher:
                 expiration_date=exp_formatted,
                 contract_type=ContractType.CALL
             )
-            log.debug("Submitting CALL request for %s %s", symbol, exp_formatted)
             call_response = self.trading.get_option_contracts(call_request)
-            log.debug("CALL response: %s", call_response)
             
             if call_response and call_response.option_contracts:
                 log.info("Got %d CALL contracts for %s %s", len(call_response.option_contracts), symbol, expiry_date)
-                for contract_meta in call_response.option_contracts:
-                    contract = self._fetch_contract_with_quote(contract_meta, OptionSide.CALL, expiry_date)
+                for i, contract_meta in enumerate(call_response.option_contracts):
+                    contract = self._fetch_contract_with_quote(contract_meta, OptionSide.CALL, expiry_date, i)
                     if contract:
                         contracts.append(contract)
+                        calls_parsed += 1
             else:
                 log.warning("No CALL contracts returned for %s %s", symbol, exp_formatted)
             
@@ -120,20 +121,20 @@ class OptionsFetcher:
                 expiration_date=exp_formatted,
                 contract_type=ContractType.PUT
             )
-            log.debug("Submitting PUT request for %s %s", symbol, exp_formatted)
             put_response = self.trading.get_option_contracts(put_request)
-            log.debug("PUT response: %s", put_response)
             
             if put_response and put_response.option_contracts:
                 log.info("Got %d PUT contracts for %s %s", len(put_response.option_contracts), symbol, expiry_date)
-                for contract_meta in put_response.option_contracts:
-                    contract = self._fetch_contract_with_quote(contract_meta, OptionSide.PUT, expiry_date)
+                for i, contract_meta in enumerate(put_response.option_contracts):
+                    contract = self._fetch_contract_with_quote(contract_meta, OptionSide.PUT, expiry_date, i)
                     if contract:
                         contracts.append(contract)
+                        puts_parsed += 1
             else:
                 log.warning("No PUT contracts returned for %s %s", symbol, exp_formatted)
             
-            log.info("Total options contracts fetched for %s: %d", symbol, len(contracts))
+            log.info("Total options contracts fetched for %s: %d (calls: %d, puts: %d)", 
+                     symbol, len(contracts), calls_parsed, puts_parsed)
             if not contracts:
                 log.warning("Empty options chain for %s expiry %s", symbol, expiry_date)
         
@@ -143,7 +144,7 @@ class OptionsFetcher:
         return contracts
 
     def _fetch_contract_with_quote(
-        self, contract_meta, side: OptionSide, expiry_date: str
+        self, contract_meta, side: OptionSide, expiry_date: str, index: int = 0
     ) -> Optional[OptionContract]:
         """Fetch quote and Greeks for a single contract.
         
@@ -151,6 +152,7 @@ class OptionsFetcher:
             contract_meta: OptionContract metadata from get_option_contracts()
             side: CALL or PUT
             expiry_date: Expiration in YYYYMMDD format
+            index: Index in list (for logging)
         
         Returns:
             OptionContract with quote data, or None if fetch fails
@@ -160,8 +162,14 @@ class OptionsFetcher:
             quote_request = OptionLatestQuoteRequest(symbol_or_symbols=contract_meta.symbol)
             quote_response = self.data.get_option_latest_quote(quote_request)
             
-            if not quote_response or contract_meta.symbol not in quote_response:
-                log.debug("No quote available for %s", contract_meta.symbol)
+            if not quote_response:
+                log.warning("Quote response EMPTY for %s[%d]", contract_meta.symbol, index)
+                return None
+            
+            if contract_meta.symbol not in quote_response:
+                log.warning("Contract %s[%d] NOT IN quote response. Keys: %s", 
+                           contract_meta.symbol, index, 
+                           list(quote_response.keys())[:5] if quote_response else "[]")
                 return None
             
             quote = quote_response[contract_meta.symbol]
@@ -171,7 +179,8 @@ class OptionsFetcher:
             ask = float(quote.ask_price) if quote.ask_price else 0
             
             if bid <= 0 or ask <= 0:
-                log.debug("Invalid bid/ask for %s: bid=%.3f ask=%.3f", contract_meta.symbol, bid, ask)
+                log.warning("Invalid bid/ask for %s[%d]: bid=%.3f ask=%.3f", 
+                           contract_meta.symbol, index, bid, ask)
                 return None
             
             # Extract Greeks (may be None)
@@ -181,6 +190,9 @@ class OptionsFetcher:
             vega = float(quote.vega) if quote.vega else 0.0
             iv = float(quote.implied_volatility) if quote.implied_volatility else 0.0
             volume = int(quote.last_quote_volume) if quote.last_quote_volume else 0
+            
+            log.info("Parsed %s[%d] %s: %.2f / %.2f delta=%.2f", 
+                    contract_meta.symbol, index, side.value, bid, ask, delta)
             
             return OptionContract(
                 symbol=contract_meta.underlying_symbol,
@@ -199,7 +211,7 @@ class OptionsFetcher:
             )
         
         except Exception as e:
-            log.debug("Failed to fetch quote for %s: %s", contract_meta.symbol, e)
+            log.warning("Exception for %s[%d]: %s", contract_meta.symbol, index, e)
             return None
 
 
@@ -225,31 +237,17 @@ class OptionSelector:
     def select_call(
         self, underlying_price: float, contracts: list[OptionContract]
     ) -> Optional[OptionContract]:
-        """Select a call contract for a LONG signal.
-        
-        Picks a slightly OTM call with reasonable Greeks and liquidity.
-        
-        Args:
-            underlying_price: Current price of underlying
-            contracts: List of call contracts to choose from
-        
-        Returns:
-            Selected OptionContract or None if no suitable contract found
-        """
-        # Filter for calls
+        """Select a call contract for a LONG signal."""
         calls = [c for c in contracts if c.side == OptionSide.CALL]
         if not calls:
             return None
 
-        # Filter for liquidity
         liquid = [c for c in calls 
                   if c.is_liquid(self.min_volume, self.max_bid_ask_spread_pct)]
         if not liquid:
             log.warning("No liquid call contracts found (checked %d contracts)", len(calls))
             return None
 
-        # Filter for reasonable delta (0.3-0.7 typical for scalping)
-        # For calls, delta is positive
         in_delta = [
             c for c in liquid
             if self.min_delta <= c.delta <= self.max_delta
@@ -259,9 +257,7 @@ class OptionSelector:
                        self.min_delta, self.max_delta, len(liquid))
             return None
 
-        # Prefer slightly OTM calls (lower delta = more OTM)
-        # Target delta ~ strike_offset_pct (e.g., 0.5% OTM ≈ 0.4-0.5 delta)
-        target_delta = self.strike_offset_pct / 100 * 0.8  # rough mapping
+        target_delta = self.strike_offset_pct / 100 * 0.8
         best = min(in_delta, key=lambda c: abs(c.delta - target_delta))
         
         log.info("Selected CALL %s strike=%.2f delta=%.2f bid=%.3f ask=%.3f spread=%.2f%%",
@@ -272,31 +268,17 @@ class OptionSelector:
     def select_put(
         self, underlying_price: float, contracts: list[OptionContract]
     ) -> Optional[OptionContract]:
-        """Select a put contract for a SHORT signal.
-        
-        Picks a slightly OTM put with reasonable Greeks and liquidity.
-        
-        Args:
-            underlying_price: Current price of underlying
-            contracts: List of put contracts to choose from
-        
-        Returns:
-            Selected OptionContract or None if no suitable contract found
-        """
-        # Filter for puts
+        """Select a put contract for a SHORT signal."""
         puts = [c for c in contracts if c.side == OptionSide.PUT]
         if not puts:
             return None
 
-        # Filter for liquidity
         liquid = [c for c in puts 
                   if c.is_liquid(self.min_volume, self.max_bid_ask_spread_pct)]
         if not liquid:
             log.warning("No liquid put contracts found (checked %d contracts)", len(puts))
             return None
 
-        # Filter for reasonable delta (puts have negative delta, use abs value)
-        # For puts, delta is negative, so we check abs(delta)
         in_delta = [
             c for c in liquid
             if self.min_delta <= abs(c.delta) <= self.max_delta
@@ -306,7 +288,6 @@ class OptionSelector:
                        self.min_delta, self.max_delta, len(liquid))
             return None
 
-        # Prefer slightly OTM puts (lower abs(delta) = more OTM)
         target_delta = self.strike_offset_pct / 100 * 0.8
         best = min(in_delta, key=lambda c: abs(abs(c.delta) - target_delta))
         
@@ -316,20 +297,12 @@ class OptionSelector:
         return best
 
     def next_market_expiry(self) -> str:
-        """Calculate next market trading day (skip weekends/holidays).
-        
-        Returns expiry date in YYYYMMDD format based on days_to_expiry.
-        """
+        """Calculate next market trading day (skip weekends/holidays)."""
         now = datetime.now(ET)
-        # Start from today + days_to_expiry, then skip forward to next weekday
         target = now + timedelta(days=self.days_to_expiry)
         
-        # Skip forward if we land on a weekend (5=Sat, 6=Sun)
         while target.weekday() >= 5:
             target += timedelta(days=1)
         
-        expiry = target.strftime("%Y%m%d")
-        log.debug("Calculated market expiry: %s (today=%s, days_ahead=%d)", 
-                  expiry, now.strftime("%Y%m%d"), self.days_to_expiry)
-        return expiry
+        return target.strftime("%Y%m%d")
 
