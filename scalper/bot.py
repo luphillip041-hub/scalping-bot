@@ -205,7 +205,7 @@ class ScalpingBot:
                     log.info("TIME EXIT %s after %d min", sym, self.cfg.max_hold_minutes)
                     try:
                         self.trading.close_position(sym)
-                        exit_price = positions[sym].current_price
+                        exit_price = float(positions[sym].current_price)  # FIX: Convert string to float
                         qty = self.risk.qty_for(entry_price)
                         pnl = (exit_price - entry_price) * qty
                         self.risk.record_close(pnl, datetime.now(ET).date())
