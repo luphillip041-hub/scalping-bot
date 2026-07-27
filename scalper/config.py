@@ -54,6 +54,16 @@ class Config:
 
     poll_seconds: int = int(os.getenv("POLL_SECONDS", "20"))
 
+    # Options (calls/puts alongside equities)
+    enable_options: bool = os.getenv("ENABLE_OPTIONS", "true").lower() == "true"
+    options_expiry_days: int = int(os.getenv("OPTIONS_EXPIRY_DAYS", "0"))  # 0 = same day, 1+ = future
+    options_strike_offset_pct: float = float(os.getenv("OPTIONS_STRIKE_OFFSET_PCT", "0.5"))  # OTM offset
+    options_position_size_usd: float = float(os.getenv("OPTIONS_POSITION_SIZE_USD", "500"))  # smaller than equity
+    options_max_delta: float = float(os.getenv("OPTIONS_MAX_DELTA", "0.8"))  # avoid too deep ITM
+    options_min_delta: float = float(os.getenv("OPTIONS_MIN_DELTA", "0.3"))  # avoid near 0 delta
+    options_max_spread_pct: float = float(os.getenv("OPTIONS_MAX_SPREAD_PCT", "2.0"))  # max bid-ask spread %
+    options_min_volume: int = int(os.getenv("OPTIONS_MIN_VOLUME", "5"))  # min contracts in last trade
+
     def validate(self):
         if not self.api_key or not self.api_secret:
             raise ValueError("Set ALPACA_API_KEY and ALPACA_API_SECRET in .env")
