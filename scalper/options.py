@@ -13,6 +13,8 @@ from typing import Optional
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import GetOptionContractsRequest
 from alpaca.trading.enums import ContractType
+from alpaca.data.historical.option import OptionHistoricalDataClient
+from alpaca.data.requests import OptionLatestQuoteRequest
 
 log = logging.getLogger("scalper")
 ET = ZoneInfo("America/New_York")
@@ -70,10 +72,11 @@ class OptionContract:
 
 
 class OptionsFetcher:
-    """Fetch and parse options contracts from Alpaca."""
+    """Fetch and parse options contracts from Alpaca with quotes and Greeks."""
 
-    def __init__(self, trading_client: TradingClient):
+    def __init__(self, trading_client: TradingClient, data_client: OptionHistoricalDataClient):
         self.trading = trading_client
+        self.data = data_client
 
     def fetch_chain(self, symbol: str, expiry_date: str) -> list[OptionContract]:
         """Fetch options chain for a symbol and specific expiration.
@@ -91,7 +94,7 @@ class OptionsFetcher:
             # Convert YYYYMMDD to YYYY-MM-DD for API
             exp_formatted = f"{expiry_date[:4]}-{expiry_date[4:6]}-{expiry_date[6:8]}"
             
-            # Fetch calls
+            # Fetch call contracts
             call_request = GetOptionContractsRequest(
                 underlying_symbol=symbol,
                 expiration_date=exp_formatted,
@@ -99,11 +102,12 @@ class OptionsFetcher:
             )
             call_response = self.trading.get_option_contracts(call_request)
             if call_response and call_response.option_contracts:
-                for contract in call_response.option_contracts:
-                    if self._has_market_data(contract):
-                        contracts.append(self._parse_contract(contract, OptionSide.CALL, expiry_date))
+                for contract_meta in call_response.option_contracts:
+                    contract = self._fetch_contract_with_quote(contract_meta, OptionSide.CALL, expiry_date)
+                    if contract:
+                        contracts.append(contract)
             
-            # Fetch puts
+            # Fetch put contracts
             put_request = GetOptionContractsRequest(
                 underlying_symbol=symbol,
                 expiration_date=exp_formatted,
@@ -111,9 +115,10 @@ class OptionsFetcher:
             )
             put_response = self.trading.get_option_contracts(put_request)
             if put_response and put_response.option_contracts:
-                for contract in put_response.option_contracts:
-                    if self._has_market_data(contract):
-                        contracts.append(self._parse_contract(contract, OptionSide.PUT, expiry_date))
+                for contract_meta in put_response.option_contracts:
+                    contract = self._fetch_contract_with_quote(contract_meta, OptionSide.PUT, expiry_date)
+                    if contract:
+                        contracts.append(contract)
             
             if not contracts:
                 log.warning("Empty options chain for %s expiry %s", symbol, expiry_date)
@@ -123,34 +128,65 @@ class OptionsFetcher:
         
         return contracts
 
-    @staticmethod
-    def _parse_contract(contract_data, side: OptionSide, expiry_date: str) -> OptionContract:
-        """Parse Alpaca contract data into OptionContract object."""
-        return OptionContract(
-            symbol=contract_data.underlying_symbol,
-            contract_symbol=contract_data.symbol,
-            side=side,
-            expiry=expiry_date,
-            strike=float(contract_data.strike_price),
-            bid=float(contract_data.quote.bid if contract_data.quote and contract_data.quote.bid else 0),
-            ask=float(contract_data.quote.ask if contract_data.quote and contract_data.quote.ask else 0),
-            delta=float(contract_data.greeks.delta if contract_data.greeks and contract_data.greeks.delta else 0),
-            theta=float(contract_data.greeks.theta if contract_data.greeks and contract_data.greeks.theta else 0),
-            gamma=float(contract_data.greeks.gamma if contract_data.greeks and contract_data.greeks.gamma else 0),
-            vega=float(contract_data.greeks.vega if contract_data.greeks and contract_data.greeks.vega else 0),
-            iv=float(contract_data.greeks.implied_volatility if contract_data.greeks and contract_data.greeks.implied_volatility else 0),
-            open_interest=int(contract_data.open_interest if contract_data.open_interest else 0),
-            volume=int(contract_data.quote.volume if contract_data.quote and contract_data.quote.volume else 0),
-        )
-
-    @staticmethod
-    def _has_market_data(contract_data) -> bool:
-        """Check if contract has valid bid/ask prices."""
-        if not contract_data.quote:
-            return False
-        bid = float(contract_data.quote.bid if contract_data.quote.bid else 0)
-        ask = float(contract_data.quote.ask if contract_data.quote.ask else 0)
-        return bid > 0 and ask > 0
+    def _fetch_contract_with_quote(
+        self, contract_meta, side: OptionSide, expiry_date: str
+    ) -> Optional[OptionContract]:
+        """Fetch quote and Greeks for a single contract.
+        
+        Args:
+            contract_meta: OptionContract metadata from get_option_contracts()
+            side: CALL or PUT
+            expiry_date: Expiration in YYYYMMDD format
+        
+        Returns:
+            OptionContract with quote data, or None if fetch fails
+        """
+        try:
+            # Get latest quote for this contract symbol
+            quote_request = OptionLatestQuoteRequest(symbol_or_symbols=contract_meta.symbol)
+            quote_response = self.data.get_option_latest_quote(quote_request)
+            
+            if not quote_response or contract_meta.symbol not in quote_response:
+                log.debug("No quote available for %s", contract_meta.symbol)
+                return None
+            
+            quote = quote_response[contract_meta.symbol]
+            
+            # Extract bid/ask
+            bid = float(quote.bid_price) if quote.bid_price else 0
+            ask = float(quote.ask_price) if quote.ask_price else 0
+            
+            if bid <= 0 or ask <= 0:
+                log.debug("Invalid bid/ask for %s: bid=%.3f ask=%.3f", contract_meta.symbol, bid, ask)
+                return None
+            
+            # Extract Greeks (may be None)
+            delta = float(quote.delta) if quote.delta else 0.0
+            theta = float(quote.theta) if quote.theta else 0.0
+            gamma = float(quote.gamma) if quote.gamma else 0.0
+            vega = float(quote.vega) if quote.vega else 0.0
+            iv = float(quote.implied_volatility) if quote.implied_volatility else 0.0
+            volume = int(quote.last_quote_volume) if quote.last_quote_volume else 0
+            
+            return OptionContract(
+                symbol=contract_meta.underlying_symbol,
+                contract_symbol=contract_meta.symbol,
+                side=side,
+                expiry=expiry_date,
+                strike=float(contract_meta.strike_price),
+                bid=bid,
+                ask=ask,
+                delta=delta,
+                theta=theta,
+                gamma=gamma,
+                vega=vega,
+                iv=iv,
+                volume=volume,
+            )
+        
+        except Exception as e:
+            log.debug("Failed to fetch quote for %s: %s", contract_meta.symbol, e)
+            return None
 
 
 class OptionSelector:
