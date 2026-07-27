@@ -93,6 +93,7 @@ class OptionsFetcher:
         try:
             # Convert YYYYMMDD to YYYY-MM-DD for API
             exp_formatted = f"{expiry_date[:4]}-{expiry_date[4:6]}-{expiry_date[6:8]}"
+            log.info("Fetching options chain for %s expiry %s (%s)", symbol, expiry_date, exp_formatted)
             
             # Fetch call contracts
             call_request = GetOptionContractsRequest(
@@ -100,12 +101,18 @@ class OptionsFetcher:
                 expiration_date=exp_formatted,
                 contract_type=ContractType.CALL
             )
+            log.debug("Submitting CALL request for %s %s", symbol, exp_formatted)
             call_response = self.trading.get_option_contracts(call_request)
+            log.debug("CALL response: %s", call_response)
+            
             if call_response and call_response.option_contracts:
+                log.info("Got %d CALL contracts for %s %s", len(call_response.option_contracts), symbol, expiry_date)
                 for contract_meta in call_response.option_contracts:
                     contract = self._fetch_contract_with_quote(contract_meta, OptionSide.CALL, expiry_date)
                     if contract:
                         contracts.append(contract)
+            else:
+                log.warning("No CALL contracts returned for %s %s", symbol, exp_formatted)
             
             # Fetch put contracts
             put_request = GetOptionContractsRequest(
@@ -113,18 +120,25 @@ class OptionsFetcher:
                 expiration_date=exp_formatted,
                 contract_type=ContractType.PUT
             )
+            log.debug("Submitting PUT request for %s %s", symbol, exp_formatted)
             put_response = self.trading.get_option_contracts(put_request)
+            log.debug("PUT response: %s", put_response)
+            
             if put_response and put_response.option_contracts:
+                log.info("Got %d PUT contracts for %s %s", len(put_response.option_contracts), symbol, expiry_date)
                 for contract_meta in put_response.option_contracts:
                     contract = self._fetch_contract_with_quote(contract_meta, OptionSide.PUT, expiry_date)
                     if contract:
                         contracts.append(contract)
+            else:
+                log.warning("No PUT contracts returned for %s %s", symbol, exp_formatted)
             
+            log.info("Total options contracts fetched for %s: %d", symbol, len(contracts))
             if not contracts:
                 log.warning("Empty options chain for %s expiry %s", symbol, expiry_date)
         
         except Exception as e:
-            log.error("Failed to fetch options chain for %s: %s", symbol, e)
+            log.error("Failed to fetch options chain for %s: %s", symbol, e, exc_info=True)
         
         return contracts
 
@@ -314,5 +328,8 @@ class OptionSelector:
         while target.weekday() >= 5:
             target += timedelta(days=1)
         
-        return target.strftime("%Y%m%d")
+        expiry = target.strftime("%Y%m%d")
+        log.debug("Calculated market expiry: %s (today=%s, days_ahead=%d)", 
+                  expiry, now.strftime("%Y%m%d"), self.days_to_expiry)
+        return expiry
 
